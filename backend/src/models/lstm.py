@@ -59,8 +59,7 @@ class LSTMModel(BaseModel):
             nn.LSTM(
                 input_size=n_features,
                 hidden_size=lstm_units[0],
-                batch_first=True,
-                return_sequences=True if len(lstm_units) > 1 else False
+                batch_first=True
             )
         )
         
@@ -69,13 +68,11 @@ class LSTMModel(BaseModel):
         
         # Additional LSTM layers
         for i, units in enumerate(lstm_units[1:], 1):
-            return_sequences = i < len(lstm_units) - 1
             self.lstm_layers.append(
                 nn.LSTM(
                     input_size=lstm_units[i-1],
                     hidden_size=units,
-                    batch_first=True,
-                    return_sequences=return_sequences
+                    batch_first=True
                 )
             )
             self.dropout_layers.append(nn.Dropout(dropout_rate))
@@ -103,30 +100,13 @@ class LSTMModel(BaseModel):
             torch.Tensor: Output tensor of shape (batch_size, 1)
         """
         # Pass through LSTM layers with dropout
-        for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
-            # Check if we need to keep sequence for next LSTM layer
-            if i < len(self.lstm_layers) - 1:
-                x, _ = lstm(x)
-                x = dropout(x)
-            else:
-                # Last LSTM layer
-                if lstm.batch_first:
-                    # If return_sequences=False, we get (batch_size, hidden_size)
-                    if not getattr(lstm, 'return_sequences', False):
-                        x, _ = lstm(x)
-                        x = dropout(x)
-                    else:
-                        # If return_sequences=True, we get (batch_size, seq_length, hidden_size)
-                        # Take the last output of the sequence
-                        x, _ = lstm(x)
-                        x = dropout(x)
-                        x = x[:, -1, :]
-                else:
-                    # If not batch_first, adjust accordingly
-                    x = x.permute(1, 0, 2)  # (seq_length, batch_size, n_features)
-                    x, _ = lstm(x)
-                    x = x[-1]  # Take the last output
-                    x = dropout(x)
+        for lstm, dropout in zip(self.lstm_layers[:-1], self.dropout_layers[:-1]):
+            x, _ = lstm(x)
+            x = dropout(x)
+        
+        # Last LSTM layer (take only the last output)
+        x, _ = self.lstm_layers[-1](x)
+        x = self.dropout_layers[-1](x[:, -1, :])  # Take the last time step
         
         # Pass through dense layers
         for i in range(0, len(self.dense_layers), 2):
@@ -213,51 +193,48 @@ class LSTMModel(BaseModel):
     def predict_sequence(self, initial_sequence, steps=30):
         """Generate multi-step predictions using the model.
         
-        This method makes recursive predictions for multiple steps ahead,
-        using each prediction as input for the next prediction.
-        
         Args:
             initial_sequence (numpy.ndarray or torch.Tensor): Initial sequence data,
-                shape (1, sequence_length, n_features).
+                shape (batch_size, sequence_length, n_features).
             steps (int): Number of steps to predict ahead.
                 
         Returns:
             numpy.ndarray: Array of predicted values for each step.
         """
-        # Make sure the model is in evaluation mode
-        self.eval()
+        if not isinstance(initial_sequence, torch.Tensor):
+            initial_sequence = torch.tensor(initial_sequence, dtype=torch.float32)
         
+        # Get sequence length from model configuration
         sequence_length = self.config['model']['sequence_length']
         
-        # Convert to PyTorch tensor if necessary
-        if isinstance(initial_sequence, np.ndarray):
-            current_sequence = torch.tensor(initial_sequence, dtype=torch.float32)
-        else:
-            current_sequence = initial_sequence.clone()
+        # Check input shape
+        if len(initial_sequence.shape) != 3 or initial_sequence.shape[1] != sequence_length:
+            raise ValueError(f"Initial sequence must have shape (batch_size, {sequence_length}, n_features)")
         
-        # Check if initial_sequence has the correct shape
-        if current_sequence.shape[1] != sequence_length:
-            raise ValueError(f"Initial sequence must have shape (1, {sequence_length}, n_features)")
+        # Move to device if needed
+        if initial_sequence.device != self.device:
+            initial_sequence = initial_sequence.to(self.device)
         
-        # Move to the same device as the model
-        current_sequence = current_sequence.to(self.device)
+        # Set model to evaluation mode
+        self.eval()
         
+        # Initialize predictions list
         predictions = []
+        current_sequence = initial_sequence
         
+        # Generate predictions one step at a time
         with torch.no_grad():
             for _ in range(steps):
-                # Make a prediction
+                # Get prediction for next step
                 next_pred = self(current_sequence)
                 predictions.append(next_pred.item())
                 
-                # Update the sequence by removing the first element and adding the new prediction
-                new_point = current_sequence[0, -1, :].clone()
-                new_point[0] = next_pred.item()  # Set the first feature (closing price) to the prediction
-                
-                # Remove first time step and add new point at the end
+                # Update sequence for next prediction
+                # Remove oldest timestep and add prediction as newest
                 current_sequence = torch.cat([
-                    current_sequence[:, 1:, :],
-                    new_point.view(1, 1, -1)
+                    current_sequence[:, 1:, :],  # Remove oldest timestep
+                    torch.zeros_like(current_sequence[:, -1:, :])  # Add new timestep
                 ], dim=1)
+                current_sequence[:, -1, 0] = next_pred  # Set the closing price
         
         return np.array(predictions) 
