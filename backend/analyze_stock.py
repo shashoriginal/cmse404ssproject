@@ -462,74 +462,322 @@ def create_dashboard_summary(symbol, price_data, signals, predictions, risk_asse
     
     return fig
 
-def analyze_stock(symbol, output_dir=None, start_date=None, end_date=None):
-    """Analyze a stock and make predictions."""
-    print(f"\nAnalyzing {symbol}...")
+def analyze_stock(symbol, output_dir=None, start_date=None, end_date=None, save_data=True):
+    """Analyze stock data and make predictions.
     
-    # Create output directory if specified
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    
-    # Prepare the data
+    Args:
+        symbol (str): Stock symbol
+        output_dir (str, optional): Directory to save results
+        start_date (str, optional): Start date in YYYY-MM-DD format
+        end_date (str, optional): End date in YYYY-MM-DD format
+        save_data (bool): Whether to save original data for dashboard
+        
+    Returns:
+        dict: Analysis results
+    """
     try:
+        print(f"\nAnalyzing {symbol}...")
+        
+        # Download and prepare stock data
         data, scaler, stock_info = prepare_stock_data(symbol, start_date, end_date)
-        print(f"\nData shape after preparation: {data.shape}")
         
-        # Create a DataFrame for visualization
-        features = ['Open', 'High', 'Low', 'Close', 'Volume', 
-                   'Returns', 'MA5', 'MA20', 'MA50', 'RSI', 'MACD']
-        df_original = pd.DataFrame(scaler.inverse_transform(data), columns=features)
+        # Keep a copy of the original dataframe
+        df_original = None
+        if save_data and stock_info is not None:
+            # Recreate original dataframe for visualization
+            stock = yf.Ticker(symbol)
+            if not end_date:
+                end_date = datetime.now()
+            if not start_date:
+                start_date = end_date - timedelta(days=730)  # 2 years
+                
+            df_original = stock.history(start=start_date, end=end_date)
+            
+            # Calculate additional features
+            df_original['Returns'] = df_original['Close'].pct_change()
+            df_original['MA5'] = df_original['Close'].rolling(window=5).mean()
+            df_original['MA20'] = df_original['Close'].rolling(window=20).mean()
+            df_original['MA50'] = df_original['Close'].rolling(window=50).mean()
+            df_original['RSI'] = calculate_rsi(df_original['Close'])
+            df_original['MACD'] = calculate_macd(df_original['Close'])
+            
+            # Drop NaN values
+            df_original = df_original.dropna()
         
-        # Calculate trading signals
-        signals = calculate_trading_signals(df_original)
+        # Determine optimal parameters
+        params = determine_optimal_parameters(df_original if df_original is not None else pd.DataFrame())
+        sequence_length = params['sequence_length']
+        prediction_days = params['prediction_days']
         
-        # Get current trading recommendation
-        current_signal = signals['overall_signal'].iloc[-1]
-        current_recommendation = signals['recommendation'].iloc[-1]
+        # Prepare data for LSTM
+        print(f"Preparing data with sequence length {sequence_length}...")
         
-        print(f"\nCurrent Trading Signals:")
-        print(f"RSI Signal: {'Buy' if signals['rsi_signal'].iloc[-1] > 0 else 'Sell' if signals['rsi_signal'].iloc[-1] < 0 else 'Neutral'}")
-        print(f"Moving Average Signal: {'Buy' if signals['ma_signal'].iloc[-1] > 0 else 'Sell' if signals['ma_signal'].iloc[-1] < 0 else 'Neutral'}")
-        print(f"MACD Signal: {'Buy' if signals['macd_signal'].iloc[-1] > 0 else 'Sell' if signals['macd_signal'].iloc[-1] < 0 else 'Neutral'}")
-        print(f"Overall Recommendation: {current_recommendation}")
+        # Create sequences for LSTM
+        X, y = [], []
+        for i in range(len(data) - sequence_length):
+            X.append(data[i:i+sequence_length])
+            # Predict the closing price (index 3)
+            y.append(data[i + sequence_length, 3])
+            
+        X, y = np.array(X), np.array(y)
         
-        # Plot correlation matrix
+        # Split data into training and testing sets
+        split = int(0.8 * len(X))
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
+        
+        # Convert to PyTorch tensors
+        X_train = torch.FloatTensor(X_train)
+        y_train = torch.FloatTensor(y_train).unsqueeze(1)
+        X_test = torch.FloatTensor(X_test)
+        y_test = torch.FloatTensor(y_test).unsqueeze(1)
+        
+        # Create and train LSTM model
+        print("Training LSTM model...")
+        
+        # Initialize model with configuration from model_config.yaml
+        config_path = os.path.join('configs', 'model_config.yaml')
+        if os.path.exists(config_path):
+            model = LSTMModel(config_path)
+        else:
+            model = LSTMModel()
+        
+        # Get the sequence length from the model's configuration
+        model_sequence_length = model.config['model']['sequence_length']
+        
+        # If the determined sequence length doesn't match the model's, use the model's
+        if sequence_length != model_sequence_length:
+            print(f"Adjusting sequence length from {sequence_length} to {model_sequence_length} to match model configuration")
+            sequence_length = model_sequence_length
+            params['sequence_length'] = model_sequence_length
+        
+        # Get the input shape for building the model
+        input_shape = (sequence_length, X_train.shape[2])
+        model.build_model(input_shape)
+        
+        # Train the model
+        device = model.device
+        X_train, y_train = X_train.to(device), y_train.to(device)
+        X_test, y_test = X_test.to(device), y_test.to(device)
+        
+        # Create data loaders
+        train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+        test_dataset = torch.utils.data.TensorDataset(X_test, y_test)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32, shuffle=False)
+        
+        # Train the model
+        model.train_model(train_loader, val_loader=None, num_epochs=50)
+        
+        # Evaluate model
+        print("Evaluating model performance...")
+        model.eval()
+        with torch.no_grad():
+            y_pred = model(X_test)
+        
+        # Calculate MSE, MAE, RMSE
+        mse = ((y_pred - y_test) ** 2).mean().item()
+        mae = (y_pred - y_test).abs().mean().item()
+        rmse = np.sqrt(mse)
+        
+        print(f"MSE: {mse:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+        
+        # Create visualizations
+        if output_dir and save_data:
+            os.makedirs(output_dir, exist_ok=True)
+            
+            plt.figure(figsize=(12, 6))
+            plt.plot(y_test.cpu().numpy(), label='Actual')
+            plt.plot(y_pred.cpu().numpy(), label='Predicted')
+            plt.title(f'{symbol} - Actual vs Predicted')
+            plt.xlabel('Test Sample')
+            plt.ylabel('Scaled Price')
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(output_dir, f'{symbol}_predictions.png'))
+            plt.close()
+            
+            # Plot residuals
+            plt.figure(figsize=(10, 6))
+            residuals = (y_pred - y_test).cpu().numpy()
+            plt.hist(residuals, bins=50)
+            plt.title(f'{symbol} - Prediction Residuals')
+            plt.xlabel('Residual')
+            plt.ylabel('Frequency')
+            plt.grid(True)
+            plt.savefig(os.path.join(output_dir, f'{symbol}_residuals.png'))
+            plt.close()
+            
+            # Plot training history if available
+            if hasattr(model, 'history') and model.history:
+                plt.figure(figsize=(12, 5))
+                plt.subplot(1, 2, 1)
+                if 'loss' in model.history:
+                    plt.plot(model.history['loss'], label='Train Loss')
+                if 'val_loss' in model.history:
+                    plt.plot(model.history['val_loss'], label='Validation Loss')
+                plt.title('Loss During Training')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.legend()
+                
+                plt.subplot(1, 2, 2)
+                if 'mae' in model.history:
+                    plt.plot(model.history['mae'], label='Train MAE')
+                if 'val_mae' in model.history:
+                    plt.plot(model.history['val_mae'], label='Validation MAE')
+                plt.title('MAE During Training')
+                plt.xlabel('Epoch')
+                plt.ylabel('MAE')
+                plt.legend()
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{symbol}_training_history.png'))
+                plt.close()
+        
+        # Calculate trading signals from the original data
+        signals = None
+        if df_original is not None:
+            print("Calculating trading signals...")
+            signals = calculate_trading_signals(df_original)
+            current_signal = signals['overall_signal'].iloc[-1]
+            current_recommendation = signals['recommendation'].iloc[-1]
+            
+            # Save signals data for dashboard if requested
+            if output_dir and save_data:
+                os.makedirs(output_dir, exist_ok=True)
+                signals.to_csv(os.path.join(output_dir, f"{symbol}_signals.csv"))
+                df_original.to_csv(os.path.join(output_dir, f"{symbol}_data.csv"))
+        else:
+            # Default values if original data is not available
+            current_signal = 0
+            current_recommendation = "Hold"
+        
+        # Print current trading signals
+        print(f"\nCurrent Trading Signals for {symbol}:")
+        if signals is not None:
+            print(f"RSI Signal: {'Bullish' if signals['rsi_signal'].iloc[-1] > 0 else 'Bearish' if signals['rsi_signal'].iloc[-1] < 0 else 'Neutral'}")
+            print(f"Moving Average Signal: {'Bullish' if signals['ma_signal'].iloc[-1] > 0 else 'Bearish' if signals['ma_signal'].iloc[-1] < 0 else 'Neutral'}")
+            print(f"MACD Signal: {'Bullish' if signals['macd_signal'].iloc[-1] > 0 else 'Bearish' if signals['macd_signal'].iloc[-1] < 0 else 'Neutral'}")
+            print(f"Overall Recommendation: {current_recommendation}")
+        
+        # Make future predictions
+        print(f"\nGenerating {prediction_days} days of future predictions...")
+        
+        # Prepare the last sequence from the data with the correct sequence length
+        last_sequence = torch.FloatTensor(data[-sequence_length:]).unsqueeze(0).to(device)
+        
+        # Use the model's predict_sequence method
+        future_predictions = model.predict_sequence(last_sequence, steps=prediction_days)
+        
+        # Inverse transform predictions to get actual price values
+        # We need to reconstruct full feature vectors for inverse transformation
+        print("Transforming predictions back to price scale...")
+        
+        # Get the last actual data point as a template
+        future_template = data[-1].copy()
+        
+        # Create array to hold all predicted values with all features
+        future_points = np.array([future_template] * len(future_predictions))
+        
+        # Update the Close price (index 3) with our predictions
+        for i, pred in enumerate(future_predictions):
+            future_points[i, 3] = pred
+        
+        # Inverse transform to get actual prices
+        future_predictions_inv = scaler.inverse_transform(future_points)[:, 3]
+        
+        # Calculate confidence intervals (95%)
+        std_dev = np.std(y_test.cpu().numpy() - y_pred.cpu().numpy())
+        lower_bound = future_predictions_inv - (1.96 * std_dev)
+        upper_bound = future_predictions_inv + (1.96 * std_dev)
+        
+        # Print predictions
+        print("\nFuture Price Predictions:")
+        for i, price in enumerate(future_predictions_inv):
+            pred_date = (datetime.now() + timedelta(days=i+1)).strftime('%Y-%m-%d')
+            print(f"{pred_date}: ${price:.2f} (95% CI: ${lower_bound[i]:.2f} - ${upper_bound[i]:.2f})")
+        
+        # Save predictions to CSV
         if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            pred_dates = [(datetime.now() + timedelta(days=i+1)).strftime('%Y-%m-%d') for i in range(len(future_predictions_inv))]
+            pred_df = pd.DataFrame({
+                'Date': pred_dates,
+                'Predicted_Price': future_predictions_inv,
+                'Lower_Bound': lower_bound,
+                'Upper_Bound': upper_bound
+            })
+            pred_df.to_csv(os.path.join(output_dir, f"{symbol}_predictions.csv"), index=False)
+            print(f"\nPredictions saved to {os.path.join(output_dir, f'{symbol}_predictions.csv')}")
+        
+        # Calculate risk assessment
+        print("\nAssessing risk profile...")
+        recent_prices = df_original['Close'].values[-30:] if df_original is not None else []
+        risk_assessment = assess_risk(params['volatility'], recent_prices, future_predictions_inv)
+        
+        # Print risk assessment
+        print(f"Volatility Risk: {risk_assessment['volatility_risk']}")
+        print(f"Predicted Price Change: {risk_assessment['predicted_change']:.2%}")
+        print(f"Overall Risk Level: {risk_assessment['overall_risk']}")
+        
+        # Perform sector analysis
+        print("\nComparing against sector performance...")
+        sector_analysis = perform_sector_analysis(symbol)
+        
+        # Print sector comparison
+        print(f"Sector: {sector_analysis['sector']}")
+        print(f"Stock Return (1Y): {sector_analysis['stock_return']:.2%}")
+        print(f"Sector Return (1Y): {sector_analysis['sector_return']:.2%}")
+        print(f"Alpha: {sector_analysis['alpha']:.2%}")
+        print(f"Beta: {sector_analysis['beta']:.2f}")
+        
+        # Create visualizations
+        if output_dir and save_data:
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Plot correlation matrix
             plt.figure(figsize=(12, 10))
-            plot_correlation_matrix(df_original, save_path=os.path.join(output_dir, f'{symbol}_correlation.png'))
+            plot_correlation_matrix(df_original)
+            plt.title(f'{symbol} Feature Correlation Matrix')
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{symbol}_correlation.png'))
             plt.close()
             
             # Plot feature distributions
             plt.figure(figsize=(15, 10))
-            for i, feature in enumerate(features):
-                plt.subplot(4, 3, i+1)
+            for i, feature in enumerate(['Close', 'Volume', 'Returns', 'RSI', 'MACD']):
+                plt.subplot(2, 3, i+1)
                 sns.histplot(df_original[feature], kde=True)
                 plt.title(f'{feature} Distribution')
             plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f'{symbol}_feature_distributions.png'))
+            plt.savefig(os.path.join(output_dir, f'{symbol}_distributions.png'))
             plt.close()
             
             # Plot time series of key features
-            plt.figure(figsize=(15, 10))
+            plt.figure(figsize=(15, 15))
+            
+            # Price and Moving Averages
             plt.subplot(3, 1, 1)
-            plt.plot(df_original['Close'], label='Close Price')
-            plt.plot(df_original['MA5'], label='5-day MA')
-            plt.plot(df_original['MA20'], label='20-day MA')
-            plt.plot(df_original['MA50'], label='50-day MA')
+            plt.plot(df_original.index, df_original['Close'], label='Close')
+            plt.plot(df_original.index, df_original['MA20'], label='20-day MA')
+            plt.plot(df_original.index, df_original['MA50'], label='50-day MA')
             plt.title(f'{symbol} Price and Moving Averages')
             plt.legend()
             
+            # RSI
             plt.subplot(3, 1, 2)
-            plt.plot(df_original['RSI'], label='RSI')
-            plt.axhline(y=70, color='r', linestyle='--')
-            plt.axhline(y=30, color='g', linestyle='--')
+            plt.plot(df_original.index, df_original['RSI'], label='RSI')
+            plt.axhline(y=70, color='r', linestyle='--', alpha=0.5)
+            plt.axhline(y=30, color='g', linestyle='--', alpha=0.5)
             plt.title('Relative Strength Index (RSI)')
             plt.legend()
             
+            # MACD
             plt.subplot(3, 1, 3)
-            plt.plot(df_original['MACD'], label='MACD')
-            plt.axhline(y=0, color='k', linestyle='--')
-            plt.title('MACD')
+            plt.plot(df_original.index, df_original['MACD'], label='MACD')
+            plt.axhline(y=0, color='black', linestyle='-', alpha=0.2)
+            plt.title('Moving Average Convergence Divergence (MACD)')
             plt.legend()
             
             plt.tight_layout()
@@ -538,282 +786,54 @@ def analyze_stock(symbol, output_dir=None, start_date=None, end_date=None):
             
             # Plot trading signals
             plt.figure(figsize=(15, 10))
+            
+            # Prices with buy/sell markers
             plt.subplot(2, 1, 1)
-            plt.plot(df_original['Close'], label='Close Price')
+            plt.plot(df_original.index, df_original['Close'], label='Close Price')
             
-            # Add buy/sell markers
-            buy_signals = signals[signals['recommendation'] == 'Buy'].index
-            sell_signals = signals[signals['recommendation'] == 'Sell'].index
+            # Add buy and sell markers
+            buy_signals = signals[signals['recommendation'] == 'Buy']
+            sell_signals = signals[signals['recommendation'] == 'Sell']
             
-            plt.scatter(buy_signals, df_original.loc[buy_signals, 'Close'], marker='^', color='g', s=100, label='Buy Signal')
-            plt.scatter(sell_signals, df_original.loc[sell_signals, 'Close'], marker='v', color='r', s=100, label='Sell Signal')
+            plt.scatter(buy_signals.index, buy_signals['price'], color='green', marker='^', s=100, label='Buy Signal')
+            plt.scatter(sell_signals.index, sell_signals['price'], color='red', marker='v', s=100, label='Sell Signal')
             
-            plt.title(f'{symbol} Trading Signals')
+            plt.title(f'{symbol} Price with Trading Signals')
             plt.legend()
             
+            # Signal strength over time
             plt.subplot(2, 1, 2)
-            plt.plot(signals['overall_signal'], label='Signal Strength')
-            plt.axhline(y=0.5, color='g', linestyle='--', label='Buy Threshold')
-            plt.axhline(y=-0.5, color='r', linestyle='--', label='Sell Threshold')
-            plt.title('Signal Strength')
+            plt.plot(signals.index, signals['overall_signal'], label='Signal Strength')
+            plt.axhline(y=0.5, color='g', linestyle='--', alpha=0.5, label='Buy Threshold')
+            plt.axhline(y=-0.5, color='r', linestyle='--', alpha=0.5, label='Sell Threshold')
+            plt.axhline(y=0, color='k', linestyle='-', alpha=0.2)
+            plt.title('Trading Signal Strength Over Time')
             plt.legend()
             
             plt.tight_layout()
             plt.savefig(os.path.join(output_dir, f'{symbol}_trading_signals.png'))
             plt.close()
-        
-    except Exception as e:
-        print(f"Error preparing data for {symbol}: {str(e)}")
-        return None
-    
-    # Determine optimal parameters
-    params = determine_optimal_parameters(pd.DataFrame(scaler.inverse_transform(data), 
-                                                     columns=['Open', 'High', 'Low', 'Close', 'Volume',
-                                                             'Returns', 'MA5', 'MA20', 'MA50', 'RSI', 'MACD']))
-    print(f"\nOptimal parameters:")
-    print(f"Sequence length: {params['sequence_length']}")
-    print(f"Prediction days: {params['prediction_days']}")
-    print(f"Volatility: {params['volatility']:.4f}")
-    
-    # Create model with optimal parameters
-    model = LSTMModel()
-    # Update model configuration with dynamic sequence length
-    model.config['model']['sequence_length'] = params['sequence_length']
-    sequence_length = params['sequence_length']
-    device = model.device  # Get the device from the model
-    print(f"\nUsing device: {device}")
-    
-    # Prepare sequences
-    X = []
-    y = []
-    for i in range(len(data) - sequence_length):
-        X.append(data[i:i + sequence_length])
-        y.append(data[i + sequence_length, 3])  # Index 3 is 'Close' price
-    
-    X = np.array(X)
-    y = np.array(y)
-    print(f"\nSequence shapes:")
-    print(f"X shape: {X.shape}")
-    print(f"y shape: {y.shape}")
-    
-    # Split into train and test sets
-    train_size = int(len(X) * 0.8)
-    X_train, X_test = X[:train_size], X[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
-    print(f"\nTrain/Test split shapes:")
-    print(f"X_train shape: {X_train.shape}")
-    print(f"X_test shape: {X_test.shape}")
-    
-    # Convert to PyTorch tensors and move to the correct device
-    X_train = torch.FloatTensor(X_train).to(device)
-    y_train = torch.FloatTensor(y_train).to(device)
-    X_test = torch.FloatTensor(X_test).to(device)
-    y_test = torch.FloatTensor(y_test).to(device)
-    print(f"\nTensor shapes on {device}:")
-    print(f"X_train tensor shape: {X_train.shape}")
-    print(f"y_train tensor shape: {y_train.shape}")
-    
-    # Build and train the model
-    print(f"\nBuilding model with input shape: {(sequence_length, data.shape[1])}")
-    model.build_model((sequence_length, data.shape[1]))
-    train_loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(X_train, y_train.reshape(-1, 1)),
-        batch_size=32,
-        shuffle=True
-    )
-    test_loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(X_test, y_test.reshape(-1, 1)),
-        batch_size=32,
-        shuffle=False
-    )
-    
-    print("\nTraining model...")
-    history = model.train_model(train_loader, val_loader=test_loader)
-    
-    # Plot training history
-    if output_dir:
-        plt.figure(figsize=(12, 5))
-        plt.subplot(1, 2, 1)
-        plt.plot(history['loss'], label='Training Loss')
-        if 'val_loss' in history:
-            plt.plot(history['val_loss'], label='Validation Loss')
-        plt.title('Model Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        
-        plt.subplot(1, 2, 2)
-        if 'mae' in history:
-            plt.plot(history['mae'], label='Training MAE')
-        if 'val_mae' in history:
-            plt.plot(history['val_mae'], label='Validation MAE')
-        plt.title('Model MAE')
-        plt.xlabel('Epoch')
-        plt.ylabel('MAE')
-        plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f'{symbol}_training_history.png'))
-        plt.close()
-    
-    # Make predictions
-    print("\nGenerating predictions...")
-    model.eval()
-    with torch.no_grad():
-        y_pred = model(X_test).cpu().numpy()  # Move predictions back to CPU for numpy operations
-    print(f"Prediction shape: {y_pred.shape}")
-    
-    # Move tensors back to CPU for numpy operations
-    y_test = y_test.cpu().numpy()
-    
-    # Inverse transform predictions
-    y_test_inv = scaler.inverse_transform(np.zeros_like(data))[:, 3]
-    y_pred_inv = scaler.inverse_transform(np.zeros_like(data))[:, 3]
-    y_test_inv[:len(y_test)] = y_test
-    y_pred_inv[:len(y_pred)] = y_pred.flatten()
-    
-    # Calculate error metrics
-    mse = np.mean((y_test - y_pred.flatten()) ** 2)
-    mae = np.mean(np.abs(y_test - y_pred.flatten()))
-    rmse = np.sqrt(mse)
-    
-    print(f"\nTest Metrics:")
-    print(f"MSE: {mse:.6f}")
-    print(f"MAE: {mae:.6f}")
-    print(f"RMSE: {rmse:.6f}")
-    
-    # Generate future predictions
-    print("\nGenerating future predictions...")
-    try:
-        # Get the last sequence from the data
-        last_sequence = data[-sequence_length:]
-        print(f"\nLast sequence shape before processing: {last_sequence.shape}")
-        
-        last_sequence = torch.FloatTensor(last_sequence).unsqueeze(0)  # Add batch dimension
-        print(f"Last sequence shape after adding batch dimension: {last_sequence.shape}")
-        
-        last_sequence = last_sequence.to(device)  # Move to the correct device
-        print(f"Last sequence device: {last_sequence.device}")
-        
-        # Generate future predictions
-        print(f"\nGenerating {params['prediction_days']} days of predictions...")
-        future_predictions = model.predict_sequence(last_sequence, steps=params['prediction_days'])
-        print(f"Future predictions shape: {future_predictions.shape}")
-        
-        # Create a proper template for inverse transformation
-        future_template = np.zeros((len(future_predictions), data.shape[1]))
-        # Set closing price (column 3) to predictions
-        future_template[:, 3] = future_predictions
-        
-        # Inverse transform the predictions
-        future_predictions_inv = scaler.inverse_transform(future_template)[:, 3]
-        print(f"Inverse transformed predictions shape: {future_predictions_inv.shape}")
-        
-        print("\nPredicted prices for the next", params['prediction_days'], "days:")
-        for i, price in enumerate(future_predictions_inv, 1):
-            print(f"Day {i}: ${price:.2f}")
             
-        if output_dir:
-            # Plot test vs predicted
-            plt.figure(figsize=(15, 8))
+            # Create dashboard summary
+            dashboard_fig = create_dashboard_summary(
+                symbol, 
+                df_original, 
+                signals, 
+                future_predictions_inv,
+                risk_assessment,
+                sector_analysis
+            )
             
-            # Plot the full test prediction comparison
-            plt.subplot(2, 1, 1)
-            plt.plot(y_test_inv, label='Actual')
-            plt.plot(y_pred_inv[:len(y_test)], label='Predicted')
-            plt.title(f'{symbol} Stock Price - Test vs Predicted (Full)')
-            plt.xlabel('Time')
-            plt.ylabel('Price')
-            plt.legend()
-            
-            # Plot the most recent test data + future predictions
-            plt.subplot(2, 1, 2)
-            recent_window = 50
-            plt.plot(y_test_inv[-recent_window:], label='Actual') 
-            plt.plot(range(recent_window), y_pred_inv[-recent_window:], label='Predicted')
-            
-            # Plot future predictions
-            future_x = range(recent_window, recent_window + len(future_predictions_inv))
-            plt.plot(future_x, future_predictions_inv, label='Future Predictions', linestyle='--')
-            
-            # Add confidence intervals (simple approximation)
-            std_dev = np.std(np.abs(y_test - y_pred.flatten()))
-            lower_bound = future_predictions_inv - 1.96 * std_dev
-            upper_bound = future_predictions_inv + 1.96 * std_dev
-            plt.fill_between(future_x, lower_bound, upper_bound, alpha=0.2, color='red')
-            
-            plt.title(f'{symbol} Stock Price - Recent and Future Predictions')
-            plt.xlabel('Days')
-            plt.ylabel('Price')
-            plt.legend()
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f'{symbol}_predictions.png'))
-            plt.close()
-            
-            # Create a residual plot
-            plt.figure(figsize=(12, 6))
-            residuals = y_test - y_pred.flatten()
-            plt.scatter(y_pred.flatten(), residuals)
-            plt.axhline(y=0, color='r', linestyle='-')
-            plt.title('Residual Plot')
-            plt.xlabel('Predicted Values')
-            plt.ylabel('Residuals')
-            plt.savefig(os.path.join(output_dir, f'{symbol}_residuals.png'))
-            plt.close()
-            
-            # Save predictions to CSV
-            dates = pd.date_range(start=datetime.now(), periods=len(future_predictions_inv))
-            predictions_df = pd.DataFrame({
-                'Date': dates,
-                'Predicted_Price': future_predictions_inv,
-                'Lower_Bound': lower_bound,
-                'Upper_Bound': upper_bound
-            })
-            predictions_df.to_csv(os.path.join(output_dir, f'{symbol}_predictions.csv'), index=False)
-        
-        # Calculate risk assessment
-        risk_assessment = assess_risk(
-            params['volatility'], 
-            df_original['Close'].values,
-            future_predictions_inv
-        )
-        
-        print("\nRisk Assessment:")
-        print(f"Volatility Risk: {risk_assessment['volatility_risk']}")
-        print(f"Predicted Price Change: {risk_assessment['predicted_change']:.2%}")
-        print(f"Downside Risk: {risk_assessment['downside_risk']:.2%}")
-        print(f"Risk-Adjusted Return: {risk_assessment['risk_adjusted_return']:.2f}")
-        print(f"Overall Risk Level: {risk_assessment['overall_risk']}")
-        
-        # Perform sector analysis
-        sector_analysis = perform_sector_analysis(symbol)
-        print(f"\nSector Analysis:")
-        print(f"Sector: {sector_analysis['sector']}")
-        print(f"Stock Return: {sector_analysis['stock_return']:.2%}")
-        print(f"Sector Return: {sector_analysis['sector_return']:.2%}")
-        print(f"Alpha: {sector_analysis['alpha']:.2%}")
-        print(f"Beta: {sector_analysis['beta']:.2f}")
-        
-        # Create dashboard summary
-        dashboard_fig = create_dashboard_summary(
-            symbol, 
-            df_original, 
-            signals, 
-            future_predictions_inv,
-            risk_assessment,
-            sector_analysis
-        )
-        
-        if output_dir:
-            dashboard_fig.savefig(os.path.join(output_dir, f'{symbol}_dashboard.png'))
-            plt.close(dashboard_fig)
+            if output_dir:
+                dashboard_fig.savefig(os.path.join(output_dir, f'{symbol}_dashboard.png'))
+                plt.close(dashboard_fig)
         
         # Return a properly formatted result dictionary
         results = {
             'symbol': symbol,
             'company_name': stock_info.get('shortName', symbol),
             'current_price': stock_info.get('regularMarketPrice', 0),
+            'stock_info': stock_info,
             'metrics': {
                 'mse': mse,
                 'mae': mae,
@@ -829,9 +849,9 @@ def analyze_stock(symbol, output_dir=None, start_date=None, end_date=None):
             'trading_signals': {
                 'current_signal': float(current_signal),
                 'recommendation': current_recommendation,
-                'rsi_signal': float(signals['rsi_signal'].iloc[-1]),
-                'ma_signal': float(signals['ma_signal'].iloc[-1]), 
-                'macd_signal': float(signals['macd_signal'].iloc[-1])
+                'rsi_signal': float(signals['rsi_signal'].iloc[-1]) if signals is not None else 0,
+                'ma_signal': float(signals['ma_signal'].iloc[-1]) if signals is not None else 0,
+                'macd_signal': float(signals['macd_signal'].iloc[-1]) if signals is not None else 0
             },
             'risk_assessment': risk_assessment,
             'sector_analysis': sector_analysis
@@ -848,6 +868,639 @@ def analyze_stock(symbol, output_dir=None, start_date=None, end_date=None):
         traceback.print_exc()
         return None
 
+def backtest_strategy(symbol, start_date=None, end_date=None, output_dir=None, initial_capital=10000):
+    """
+    Backtest the trading strategy based on model predictions.
+    
+    Args:
+        symbol (str): Stock symbol
+        start_date (str, optional): Start date in YYYY-MM-DD format
+        end_date (str, optional): End date in YYYY-MM-DD format
+        output_dir (str, optional): Directory to save backtest results
+        initial_capital (float): Initial investment amount
+        
+    Returns:
+        dict: Backtest performance metrics
+    """
+    print(f"\nBacktesting trading strategy for {symbol}...")
+    
+    try:
+        # If dates not provided, use last 2 years of data
+        if not end_date:
+            end_date = datetime.now()
+        if not start_date:
+            start_date = end_date - timedelta(days=730)  # 2 years
+            
+        # Download stock data
+        stock = yf.Ticker(symbol)
+        df = stock.history(start=start_date, end=end_date)
+        
+        if len(df) < 100:
+            raise ValueError(f"Insufficient data for {symbol}. Found only {len(df)} days of data.")
+        
+        # Calculate features needed for trading signals
+        df['Returns'] = df['Close'].pct_change()
+        df['MA5'] = df['Close'].rolling(window=5).mean()
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA50'] = df['Close'].rolling(window=50).mean()
+        df['RSI'] = calculate_rsi(df['Close'])
+        df['MACD'] = calculate_macd(df['Close'])
+        
+        # Drop any rows with NaN values
+        df = df.dropna().copy()
+        
+        # Initialize model and parameters
+        params = determine_optimal_parameters(df)
+        sequence_length = params['sequence_length']
+        
+        # Set up strategy parameters
+        lookback_window = sequence_length
+        prediction_window = 5  # Number of days to predict ahead
+        
+        # Prepare backtest dataframe
+        backtest_df = df.copy()
+        backtest_df['Position'] = 0   # 1: Long, -1: Short, 0: No position
+        backtest_df['Signal'] = 0     # 1: Buy, -1: Sell, 0: Hold
+        backtest_df['PredictedReturn'] = np.nan
+        
+        # Prepare data for model
+        # Select features for prediction
+        features = ['Open', 'High', 'Low', 'Close', 'Volume', 
+                   'Returns', 'MA5', 'MA20', 'MA50', 'RSI', 'MACD']
+        
+        if all(feature in backtest_df.columns for feature in features):
+            data = backtest_df[features].values
+        else:
+            available_features = [f for f in features if f in backtest_df.columns]
+            data = backtest_df[available_features].values
+            print(f"Warning: Using only available features: {available_features}")
+        
+        # Scale the data
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(data)
+        
+        # Load or create model
+        config_path = os.path.join('configs', 'model_config.yaml')
+        if os.path.exists(config_path):
+            model = LSTMModel(config_path)
+        else:
+            model = LSTMModel()  # Use default config
+        
+        # Set up model parameters
+        input_shape = (sequence_length, data.shape[1])
+        model.build_model(input_shape)
+        
+        model_path = os.path.join('models', f'{symbol}_lstm_model.pth')
+        
+        if not os.path.exists(model_path):
+            # Train model if it doesn't exist
+            print(f"Model not found. Training new model for {symbol}...")
+            
+            # Prepare data for training
+            X, y = [], []
+            for i in range(len(scaled_data) - sequence_length - prediction_window):
+                X.append(scaled_data[i:i+sequence_length])
+                # Predict the closing price
+                # Find the index of 'Close' in the features list
+                close_idx = features.index('Close') if 'Close' in features else 3  # Default to 3 if missing
+                y.append(scaled_data[i+sequence_length+prediction_window, close_idx])
+                
+            X, y = np.array(X), np.array(y)
+            
+            # Split the data
+            split = int(0.8 * len(X))
+            X_train, X_val = X[:split], X[split:]
+            y_train, y_val = y[:split], y[split:]
+            
+            # Convert to PyTorch tensors
+            X_train = torch.FloatTensor(X_train)
+            y_train = torch.FloatTensor(y_train).unsqueeze(1)
+            X_val = torch.FloatTensor(X_val)
+            y_val = torch.FloatTensor(y_val).unsqueeze(1)
+            
+            # Create datasets and data loaders
+            train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+            val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
+            train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
+            val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=False)
+            
+            # Train model
+            model.train_model(train_loader, val_loader=val_loader, num_epochs=50)
+            
+            # Save model
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            model.save(model_path)
+        else:
+            model.load(model_path)
+        
+        device = model.device
+        
+        # Perform backtesting
+        print(f"Running backtest from {start_date} to {end_date}...")
+        
+        # We need at least lookback_window + prediction_window days before making predictions
+        start_idx = lookback_window + prediction_window
+        
+        positions = []
+        capital = initial_capital
+        portfolio_values = [capital]
+        cash = capital
+        shares = 0
+        trades = []
+        entry_price = 0
+        
+        # For each trading day in our backtest period
+        for i in range(start_idx, len(backtest_df) - prediction_window):
+            current_date = backtest_df.index[i]
+            current_price = backtest_df['Close'].iloc[i]
+            
+            # Get the sequence for prediction
+            sequence = scaled_data[i-lookback_window:i]
+            sequence_tensor = torch.FloatTensor(sequence).unsqueeze(0).to(device)
+            
+            # Make prediction
+            with torch.no_grad():
+                predicted_scaled = model(sequence_tensor)
+                
+            # Convert prediction back to price scale (denormalize)
+            # We need to reconstruct a full feature vector to inverse transform
+            close_idx = features.index('Close') if 'Close' in features else 3  # Default to 3 if missing
+            
+            # Create a template of the current features
+            last_features = scaled_data[i].copy()
+            # Update closing price with the prediction
+            last_features[close_idx] = predicted_scaled.item()
+            # Inverse transform to get the actual price
+            predicted_features = scaler.inverse_transform(last_features.reshape(1, -1))
+            predicted_price = predicted_features[0, close_idx]
+            
+            # Calculate predicted return
+            predicted_return = (predicted_price / current_price) - 1
+            backtest_df.loc[current_date, 'PredictedReturn'] = predicted_return
+            
+            # Generate signals based on predicted return
+            if predicted_return > 0.01:  # 1% threshold for buy
+                backtest_df.loc[current_date, 'Signal'] = 1
+                
+                # If we don't have a position, enter a long position
+                if backtest_df.loc[backtest_df.index[i-1], 'Position'] <= 0:
+                    backtest_df.loc[current_date, 'Position'] = 1
+                    
+                    # Record trade
+                    if cash > 0:
+                        entry_price = current_price
+                        shares_to_buy = cash // current_price
+                        shares += shares_to_buy
+                        cash -= shares_to_buy * current_price
+                        trades.append({
+                            'date': current_date,
+                            'type': 'buy',
+                            'price': current_price,
+                            'shares': shares_to_buy,
+                            'value': shares_to_buy * current_price
+                        })
+            
+            elif predicted_return < -0.01:  # -1% threshold for sell
+                backtest_df.loc[current_date, 'Signal'] = -1
+                
+                # If we have a long position, exit
+                if backtest_df.loc[backtest_df.index[i-1], 'Position'] >= 1:
+                    backtest_df.loc[current_date, 'Position'] = -1
+                    
+                    # Record trade
+                    if shares > 0:
+                        exit_price = current_price
+                        cash += shares * current_price
+                        trades.append({
+                            'date': current_date,
+                            'type': 'sell',
+                            'price': current_price,
+                            'shares': shares,
+                            'value': shares * current_price,
+                            'profit': shares * (exit_price - entry_price)
+                        })
+                        shares = 0
+            
+            else:
+                # Hold current position
+                backtest_df.loc[current_date, 'Signal'] = 0
+                backtest_df.loc[current_date, 'Position'] = backtest_df.loc[backtest_df.index[i-1], 'Position']
+            
+            # Calculate portfolio value
+            portfolio_value = cash + (shares * current_price)
+            portfolio_values.append(portfolio_value)
+            positions.append(backtest_df.loc[current_date, 'Position'])
+        
+        # Calculate backtest metrics
+        backtest_df = backtest_df.iloc[start_idx:-prediction_window].copy()
+        
+        # Fix the portfolio values length to match the dataframe index
+        if len(portfolio_values) != len(backtest_df):
+            print(f"Adjusting portfolio values length from {len(portfolio_values)} to {len(backtest_df)}")
+            portfolio_values = portfolio_values[:len(backtest_df)]
+            
+        backtest_df['PortfolioValue'] = portfolio_values
+        backtest_df['CumulativeReturn'] = (backtest_df['PortfolioValue'] / initial_capital) - 1
+        
+        # Calculate benchmark (buy and hold)
+        initial_price = backtest_df['Close'].iloc[0]
+        final_price = backtest_df['Close'].iloc[-1]
+        benchmark_return = (final_price / initial_price) - 1
+        
+        # Calculate performance metrics
+        total_days = len(backtest_df)
+        trading_days_per_year = 252
+        years = total_days / trading_days_per_year
+        
+        # Total return
+        total_return = (portfolio_values[-1] / initial_capital) - 1
+        
+        # Annualized return
+        annualized_return = (1 + total_return) ** (1 / years) - 1
+        
+        # Volatility
+        daily_returns = backtest_df['PortfolioValue'].pct_change().dropna()
+        volatility = daily_returns.std()
+        annualized_volatility = volatility * (trading_days_per_year ** 0.5)
+        
+        # Sharpe ratio (assuming risk-free rate of 0.02)
+        risk_free_rate = 0.02
+        sharpe_ratio = (annualized_return - risk_free_rate) / annualized_volatility
+        
+        # Maximum drawdown
+        cumulative_returns = (1 + daily_returns).cumprod()
+        rolling_max = cumulative_returns.cummax()
+        drawdowns = (cumulative_returns / rolling_max) - 1
+        max_drawdown = drawdowns.min()
+        
+        # Filter out trades with zero shares (signals that didn't result in actual trades)
+        actual_trades = [trade for trade in trades if trade.get('shares', 0) > 0]
+        sell_trades = [trade for trade in actual_trades if trade.get('type') == 'sell' and 'profit' in trade]
+        
+        # Win rate based on completed trades (buy and sell pairs)
+        profitable_trades = sum(1 for trade in sell_trades if trade.get('profit', 0) > 0)
+        win_rate = profitable_trades / len(sell_trades) if sell_trades else 0
+        
+        # Calculate final metrics
+        metrics = {
+            'initial_capital': initial_capital,
+            'final_value': portfolio_values[-1],
+            'total_return': total_return,
+            'annualized_return': annualized_return,
+            'benchmark_return': benchmark_return,
+            'excess_return': total_return - benchmark_return,
+            'volatility': volatility,
+            'annualized_volatility': annualized_volatility,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown,
+            'trades': len(actual_trades),
+            'completed_trades': len(sell_trades),
+            'win_rate': win_rate,
+            'duration': f"{total_days} days ({years:.2f} years)"
+        }
+        
+        # Generate visualizations
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Plot portfolio value and benchmark
+            plt.figure(figsize=(12, 6))
+            plt.plot(backtest_df.index, backtest_df['PortfolioValue'], label='Strategy')
+            plt.plot(backtest_df.index, initial_capital * (1 + benchmark_return * (backtest_df.index - backtest_df.index[0]).days / (backtest_df.index[-1] - backtest_df.index[0]).days), label='Buy and Hold')
+            plt.title(f'Backtest Results: {symbol} Strategy vs Buy and Hold')
+            plt.xlabel('Date')
+            plt.ylabel('Portfolio Value ($)')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{symbol}_backtest_performance.png'))
+            plt.close()
+            
+            # Plot signals and positions
+            plt.figure(figsize=(12, 8))
+            
+            # Price and signals subplot
+            ax1 = plt.subplot(2, 1, 1)
+            ax1.plot(backtest_df.index, backtest_df['Close'], label='Close Price')
+            
+            # Plot buy signals
+            buy_signals = backtest_df[backtest_df['Signal'] == 1]
+            ax1.scatter(buy_signals.index, buy_signals['Close'], color='green', marker='^', s=100, label='Buy Signal')
+            
+            # Plot sell signals
+            sell_signals = backtest_df[backtest_df['Signal'] == -1]
+            ax1.scatter(sell_signals.index, sell_signals['Close'], color='red', marker='v', s=100, label='Sell Signal')
+            
+            ax1.set_title(f'{symbol} Price and Trading Signals')
+            ax1.set_ylabel('Price ($)')
+            ax1.legend()
+            ax1.grid(True)
+            
+            # Position and portfolio value subplot
+            ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+            ax2.plot(backtest_df.index, backtest_df['CumulativeReturn'] * 100, label='Strategy Return (%)')
+            ax2.set_title(f'{symbol} Cumulative Return')
+            ax2.set_xlabel('Date')
+            ax2.set_ylabel('Return (%)')
+            ax2.legend()
+            ax2.grid(True)
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{symbol}_backtest_signals.png'))
+            plt.close()
+            
+            # Plot trade distribution
+            if trades:
+                profits = [trade.get('profit', 0) for trade in trades if 'profit' in trade]
+                
+                plt.figure(figsize=(10, 6))
+                plt.hist(profits, bins=20, color='skyblue', edgecolor='black')
+                plt.axvline(0, color='red', linestyle='--')
+                plt.title(f'{symbol} Trade Profit Distribution')
+                plt.xlabel('Profit ($)')
+                plt.ylabel('Number of Trades')
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{symbol}_backtest_trades.png'))
+                plt.close()
+                
+                # Save trade log
+                trade_df = pd.DataFrame(trades)
+                trade_df.to_csv(os.path.join(output_dir, f'{symbol}_trade_log.csv'), index=False)
+            
+            # Save backtest results
+            backtest_df.to_csv(os.path.join(output_dir, f'{symbol}_backtest_results.csv'))
+            
+            # Save backtest metrics
+            metrics_file = os.path.join(output_dir, f'{symbol}_backtest_metrics.txt')
+            with open(metrics_file, 'w', encoding='utf-8') as f:
+                f.write(f"=================================================\n")
+                f.write(f"  BACKTEST RESULTS FOR {symbol}\n")
+                f.write(f"=================================================\n\n")
+                f.write(f"Backtest Period: {backtest_df.index[0].strftime('%Y-%m-%d')} to {backtest_df.index[-1].strftime('%Y-%m-%d')} ({metrics['duration']})\n\n")
+                
+                f.write(f"PERFORMANCE METRICS\n")
+                f.write(f"-------------------\n")
+                f.write(f"Initial Capital: ${metrics['initial_capital']:,.2f}\n")
+                f.write(f"Final Value: ${metrics['final_value']:,.2f}\n")
+                f.write(f"Total Return: {metrics['total_return']:.2%}\n")
+                f.write(f"Annualized Return: {metrics['annualized_return']:.2%}\n")
+                f.write(f"Benchmark Return (Buy & Hold): {metrics['benchmark_return']:.2%}\n")
+                f.write(f"Excess Return: {metrics['excess_return']:.2%}\n")
+                f.write(f"Annualized Volatility: {metrics['annualized_volatility']:.2%}\n")
+                f.write(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}\n")
+                f.write(f"Maximum Drawdown: {metrics['max_drawdown']:.2%}\n\n")
+                
+                f.write(f"TRADING STATISTICS\n")
+                f.write(f"------------------\n")
+                f.write(f"Total Trades: {metrics['trades']}\n")
+                f.write(f"Completed Trades: {metrics['completed_trades']}\n")
+                f.write(f"Win Rate: {metrics['win_rate']:.2%}\n")
+                if sell_trades:
+                    avg_profit = sum(trade.get('profit', 0) for trade in sell_trades) / len(sell_trades)
+                    f.write(f"Average Profit per Trade: ${avg_profit:.2f}\n")
+                    
+                    avg_win = sum(trade.get('profit', 0) for trade in sell_trades if trade.get('profit', 0) > 0) / profitable_trades if profitable_trades else 0
+                    losing_trades = len(sell_trades) - profitable_trades
+                    avg_loss = sum(trade.get('profit', 0) for trade in sell_trades if trade.get('profit', 0) <= 0) / losing_trades if losing_trades else 0
+                    f.write(f"Average Win: ${avg_win:.2f}\n")
+                    f.write(f"Average Loss: ${avg_loss:.2f}\n")
+                    
+                    if avg_loss != 0:
+                        profit_factor = abs(sum(trade.get('profit', 0) for trade in sell_trades if trade.get('profit', 0) > 0) / 
+                                        sum(trade.get('profit', 0) for trade in sell_trades if trade.get('profit', 0) <= 0))
+                        f.write(f"Profit Factor: {profit_factor:.2f}\n")
+                
+                f.write("\n")
+                f.write("CONCLUSION\n")
+                f.write("----------\n")
+                
+                # Generate conclusion
+                if metrics['total_return'] > metrics['benchmark_return']:
+                    f.write(f"The trading strategy outperformed the buy-and-hold approach by {metrics['excess_return']:.2%}.\n")
+                else:
+                    f.write(f"The trading strategy underperformed the buy-and-hold approach by {-metrics['excess_return']:.2%}.\n")
+                
+                if metrics['sharpe_ratio'] > 1:
+                    f.write(f"With a Sharpe Ratio of {metrics['sharpe_ratio']:.2f}, the strategy shows good risk-adjusted returns.\n")
+                else:
+                    f.write(f"With a Sharpe Ratio of {metrics['sharpe_ratio']:.2f}, the strategy may not offer sufficient risk-adjusted returns.\n")
+                
+                if metrics['completed_trades'] > 0:
+                    if metrics['win_rate'] > 0.5:
+                        f.write(f"The win rate of {metrics['win_rate']:.2%} indicates a reliable signal generation mechanism.\n")
+                    else:
+                        f.write(f"The win rate of {metrics['win_rate']:.2%} suggests the signal generation needs improvement.\n")
+                else:
+                    f.write("No completed trades occurred during the backtest period.\n")
+                
+                f.write("\n")
+                f.write("DISCLAIMER\n")
+                f.write("----------\n")
+                f.write("Past performance is not indicative of future results.\n")
+                f.write("This backtest is based on historical data and does not account for trading costs, slippage, or market impact.\n")
+                f.write("All investment strategies involve risk and may result in loss of capital.\n")
+            
+            print(f"\nBacktest results saved to {output_dir}")
+        
+        return metrics
+        
+    except Exception as e:
+        print(f"Error during backtesting: {str(e)}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def create_comprehensive_dashboard(symbol, analysis_results, backtest_metrics, df_original, signals, future_predictions, output_dir):
+    """
+    Create a comprehensive dashboard showing both analysis and backtesting results.
+    
+    Args:
+        symbol (str): Stock symbol
+        analysis_results (dict): Results from analyze_stock function
+        backtest_metrics (dict): Results from backtest_strategy function
+        df_original (pd.DataFrame): Original stock price data
+        signals (pd.DataFrame): Trading signals
+        future_predictions (np.array): Future price predictions
+        output_dir (str): Directory to save the dashboard
+    """
+    # Create a large figure for the dashboard
+    plt.figure(figsize=(20, 16))
+    plt.suptitle(f'Comprehensive Analysis & Backtest Dashboard: {symbol}', fontsize=20, y=0.98)
+    
+    # Main grid: 4 rows, 3 columns
+    grid = plt.GridSpec(4, 3, hspace=0.4, wspace=0.3)
+    
+    # Row 1: Price Chart with Signals and Predictions
+    ax_price = plt.subplot(grid[0, :])
+    ax_price.plot(df_original.index, df_original['Close'], label='Close Price')
+    
+    # Add trading signals to the chart
+    buy_signals = signals[signals['recommendation'] == 'Buy']
+    sell_signals = signals[signals['recommendation'] == 'Sell']
+    
+    ax_price.scatter(buy_signals.index, buy_signals['price'], color='green', marker='^', s=100, label='Buy Signal')
+    ax_price.scatter(sell_signals.index, sell_signals['price'], color='red', marker='v', s=100, label='Sell Signal')
+    
+    # Add future predictions
+    last_date = df_original.index[-1]
+    future_dates = pd.date_range(start=last_date, periods=len(future_predictions)+1)[1:]
+    ax_price.plot(future_dates, future_predictions, 'b--', label='Predictions')
+    
+    # Add confidence intervals if available
+    if 'lower_bound' in analysis_results['future_predictions'] and 'upper_bound' in analysis_results['future_predictions']:
+        lb = analysis_results['future_predictions']['lower_bound']
+        ub = analysis_results['future_predictions']['upper_bound']
+        ax_price.fill_between(future_dates, lb, ub, color='blue', alpha=0.1, label='95% Confidence')
+    
+    ax_price.set_title(f'{symbol} Price, Signals & Predictions')
+    ax_price.set_ylabel('Price ($)')
+    ax_price.legend(loc='best')
+    ax_price.grid(True)
+    
+    # Row 2, Col 1: Backtesting Performance
+    if backtest_metrics:
+        ax_backtest = plt.subplot(grid[1, 0:2])
+        
+        # Get backtest results from the saved file
+        backtest_file = os.path.join(output_dir, f'{symbol}_backtest_results.csv')
+        if os.path.exists(backtest_file):
+            backtest_df = pd.read_csv(backtest_file, index_col=0, parse_dates=True)
+            
+            # Plot strategy vs buy & hold
+            initial_capital = backtest_metrics['initial_capital']
+            ax_backtest.plot(backtest_df.index, backtest_df['PortfolioValue'], label='Strategy')
+            
+            benchmark_values = initial_capital * (1 + backtest_df['Close'].pct_change().cumsum())
+            ax_backtest.plot(backtest_df.index, benchmark_values, label='Buy and Hold')
+            
+            ax_backtest.set_title(f'Backtest Performance: Strategy vs Buy & Hold')
+            ax_backtest.set_ylabel('Portfolio Value ($)')
+            ax_backtest.legend()
+            ax_backtest.grid(True)
+        
+        # Row 2, Col 3: Backtest Metrics
+        ax_metrics = plt.subplot(grid[1, 2])
+        metrics_text = [
+            f"Initial Capital: ${backtest_metrics['initial_capital']:,.0f}",
+            f"Final Value: ${backtest_metrics['final_value']:,.0f}",
+            f"Total Return: {backtest_metrics['total_return']:.2%}",
+            f"Buy & Hold: {backtest_metrics['benchmark_return']:.2%}",
+            f"Excess Return: {backtest_metrics['excess_return']:.2%}",
+            f"Sharpe Ratio: {backtest_metrics['sharpe_ratio']:.2f}",
+            f"Max Drawdown: {backtest_metrics['max_drawdown']:.2%}",
+            f"Win Rate: {backtest_metrics['win_rate']:.2%}",
+            f"Total Trades: {backtest_metrics['trades']}"
+        ]
+        
+        ax_metrics.axis('off')
+        
+        # Use different colors based on performance
+        color_total = 'green' if backtest_metrics['total_return'] > 0 else 'red'
+        color_excess = 'green' if backtest_metrics['excess_return'] > 0 else 'red'
+        color_sharpe = 'green' if backtest_metrics['sharpe_ratio'] > 1 else 'orange' if backtest_metrics['sharpe_ratio'] > 0 else 'red'
+        
+        # Add metrics with colors
+        ax_metrics.text(0.5, 0.95, "BACKTEST METRICS", ha='center', va='top', fontsize=14, fontweight='bold')
+        ax_metrics.text(0.0, 0.85, metrics_text[0], fontsize=11)
+        ax_metrics.text(0.0, 0.75, metrics_text[1], fontsize=11)
+        ax_metrics.text(0.0, 0.65, metrics_text[2], fontsize=11, color=color_total, fontweight='bold')
+        ax_metrics.text(0.0, 0.55, metrics_text[3], fontsize=11)
+        ax_metrics.text(0.0, 0.45, metrics_text[4], fontsize=11, color=color_excess, fontweight='bold')
+        ax_metrics.text(0.0, 0.35, metrics_text[5], fontsize=11, color=color_sharpe)
+        ax_metrics.text(0.0, 0.25, metrics_text[6], fontsize=11)
+        ax_metrics.text(0.0, 0.15, metrics_text[7], fontsize=11)
+        ax_metrics.text(0.0, 0.05, metrics_text[8], fontsize=11)
+    
+    # Row 3: Technical Indicators
+    ax_indicators = plt.subplot(grid[2, :])
+    
+    # Plot RSI
+    ax_indicators.plot(df_original.index, df_original['RSI'], label='RSI')
+    ax_indicators.axhline(y=70, color='r', linestyle='--', alpha=0.5)
+    ax_indicators.axhline(y=30, color='g', linestyle='--', alpha=0.5)
+    
+    # Add MACD
+    ax_indicators.plot(df_original.index, df_original['MACD'], label='MACD')
+    ax_indicators.axhline(y=0, color='black', linestyle='-', alpha=0.2)
+    
+    ax_indicators.set_title('Technical Indicators')
+    ax_indicators.legend(loc='best')
+    ax_indicators.grid(True)
+    
+    # Row 4, Col 1: Trading Signal Distribution
+    ax_signals = plt.subplot(grid[3, 0])
+    signal_counts = signals['recommendation'].value_counts()
+    colors = ['green' if x == 'Buy' else 'red' if x == 'Sell' else 'gray' for x in signal_counts.index]
+    ax_signals.bar(signal_counts.index, signal_counts.values, color=colors)
+    ax_signals.set_title('Trading Signal Distribution')
+    ax_signals.set_ylabel('Count')
+    ax_signals.grid(axis='y')
+    
+    # Row 4, Col 2: Risk Assessment
+    ax_risk = plt.subplot(grid[3, 1])
+    ax_risk.axis('off')
+    
+    # Risk assessment text
+    risk_text = [
+        f"Volatility Risk: {analysis_results['risk_assessment']['volatility_risk']}",
+        f"Predicted Change: {analysis_results['risk_assessment']['predicted_change']:.2%}",
+        f"Risk-Adjusted Return: {analysis_results['risk_assessment']['risk_adjusted_return']:.2f}",
+        f"Overall Risk Level: {analysis_results['risk_assessment']['overall_risk']}"
+    ]
+    
+    ax_risk.text(0.5, 0.95, "RISK ASSESSMENT", ha='center', va='top', fontsize=14, fontweight='bold')
+    
+    # Color-code risk levels
+    vol_color = 'green' if analysis_results['risk_assessment']['volatility_risk'] == 'Low' else 'orange' if analysis_results['risk_assessment']['volatility_risk'] == 'Medium' else 'red'
+    change_color = 'green' if analysis_results['risk_assessment']['predicted_change'] > 0 else 'red'
+    overall_color = 'green' if analysis_results['risk_assessment']['overall_risk'] == 'Low' else 'orange' if analysis_results['risk_assessment']['overall_risk'] == 'Medium' else 'red'
+    
+    ax_risk.text(0.0, 0.75, risk_text[0], fontsize=11, color=vol_color)
+    ax_risk.text(0.0, 0.55, risk_text[1], fontsize=11, color=change_color)
+    ax_risk.text(0.0, 0.35, risk_text[2], fontsize=11)
+    ax_risk.text(0.0, 0.15, risk_text[3], fontsize=11, color=overall_color, fontweight='bold')
+    
+    # Row 4, Col 3: Sector Comparison
+    ax_sector = plt.subplot(grid[3, 2])
+    ax_sector.axis('off')
+    
+    sector_text = [
+        f"Sector: {analysis_results['sector_analysis']['sector']}",
+        f"Stock Return: {analysis_results['sector_analysis']['stock_return']:.2%}",
+        f"Sector Return: {analysis_results['sector_analysis']['sector_return']:.2%}",
+        f"Alpha: {analysis_results['sector_analysis']['alpha']:.2%}",
+        f"Beta: {analysis_results['sector_analysis']['beta']:.2f}"
+    ]
+    
+    ax_sector.text(0.5, 0.95, "SECTOR COMPARISON", ha='center', va='top', fontsize=14, fontweight='bold')
+    
+    # Color-code sector comparison
+    stock_color = 'green' if analysis_results['sector_analysis']['stock_return'] > 0 else 'red'
+    sector_color = 'green' if analysis_results['sector_analysis']['sector_return'] > 0 else 'red'
+    alpha_color = 'green' if analysis_results['sector_analysis']['alpha'] > 0 else 'red'
+    
+    ax_sector.text(0.0, 0.8, sector_text[0], fontsize=11)
+    ax_sector.text(0.0, 0.65, sector_text[1], fontsize=11, color=stock_color)
+    ax_sector.text(0.0, 0.5, sector_text[2], fontsize=11, color=sector_color)
+    ax_sector.text(0.0, 0.35, sector_text[3], fontsize=11, color=alpha_color, fontweight='bold')
+    ax_sector.text(0.0, 0.2, sector_text[4], fontsize=11)
+    
+    # Add timestamp and disclaimer
+    plt.figtext(0.5, 0.01, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Disclaimer: For informational purposes only. Past performance is not indicative of future results.", 
+                ha="center", fontsize=10, style='italic')
+    
+    # Save the dashboard
+    plt.tight_layout(rect=[0, 0.02, 1, 0.98])
+    dashboard_path = os.path.join(output_dir, f'{symbol}_comprehensive_dashboard.png')
+    plt.savefig(dashboard_path, dpi=150)
+    plt.close()
+    
+    print(f"Comprehensive dashboard saved to {dashboard_path}")
+    
+    return dashboard_path
+
 def main():
     """Main function to run the stock analysis from command line."""
     parser = argparse.ArgumentParser(description='Analyze stock data and make predictions')
@@ -857,34 +1510,58 @@ def main():
     parser.add_argument('--end-date', type=str, help='End date (YYYY-MM-DD)')
     parser.add_argument('--no-plots', action='store_true', help='Disable plotting')
     parser.add_argument('--detailed', action='store_true', help='Generate detailed report')
+    parser.add_argument('--backtest', action='store_true', help='Run backtesting of the model trading strategy')
+    parser.add_argument('--initial-capital', type=float, default=10000, help='Initial capital for backtesting (default: $10,000)')
+    parser.add_argument('--full-dashboard', action='store_true', help='Generate a comprehensive dashboard with analysis and backtest results')
     
     args = parser.parse_args()
     
     output_dir = None if args.no_plots else args.output
     
     try:
-        results = analyze_stock(args.symbol, output_dir, args.start_date, args.end_date)
-        if results:
+        # Run stock analysis
+        analysis_results = analyze_stock(args.symbol, output_dir, args.start_date, args.end_date)
+        
+        # Variables for comprehensive dashboard
+        df_original = None
+        signals = None
+        future_predictions = None
+        backtest_metrics = None
+        
+        if analysis_results:
+            # Extract data for dashboard
+            if output_dir:
+                # Try to load original dataframe and signals from saved files
+                df_file = os.path.join(output_dir, f'{args.symbol}_data.csv')
+                if os.path.exists(df_file):
+                    df_original = pd.read_csv(df_file, index_col=0, parse_dates=True)
+                
+                signals_file = os.path.join(output_dir, f'{args.symbol}_signals.csv')
+                if os.path.exists(signals_file):
+                    signals = pd.read_csv(signals_file, index_col=0, parse_dates=True)
+                
+                future_predictions = analysis_results['future_predictions']['prices']
+            
             # Save results to file
             if args.output:
                 os.makedirs(args.output, exist_ok=True)
                 results_file = os.path.join(args.output, f'{args.symbol}_analysis.txt')
                 
-                with open(results_file, 'w') as f:
+                with open(results_file, 'w', encoding='utf-8') as f:
                     # Report header
-                    f.write(f"═════════════════════════════════════════════════════════\n")
-                    f.write(f"  STOCK ANALYSIS REPORT FOR {results['company_name'].upper()} ({args.symbol})\n")
-                    f.write(f"═════════════════════════════════════════════════════════\n\n")
+                    f.write(f"=================================================\n")
+                    f.write(f"  STOCK ANALYSIS REPORT FOR {analysis_results['company_name'].upper()} ({args.symbol})\n")
+                    f.write(f"=================================================\n\n")
                     f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                     
                     # Current stock information
                     f.write(f"CURRENT STOCK INFORMATION\n")
-                    f.write(f"━━━━━━━━━━━━━━━━━━━━━━━━\n")
-                    f.write(f"Current Price: ${results['current_price']:.2f}\n")
-                    f.write(f"Volatility: {results['model_params']['volatility']:.4f}\n")
+                    f.write(f"-------------------------\n")
+                    f.write(f"Current Price: ${analysis_results['current_price']:.2f}\n")
+                    f.write(f"Volatility: {analysis_results['model_params']['volatility']:.4f}\n")
                     
-                    if 'stock_info' in results and results['stock_info'] is not None:
-                        stock_info = results['stock_info']
+                    if 'stock_info' in analysis_results and analysis_results['stock_info'] is not None:
+                        stock_info = analysis_results['stock_info']
                         if 'marketCap' in stock_info:
                             market_cap = stock_info['marketCap']
                             if market_cap >= 1e12:
@@ -915,10 +1592,10 @@ def main():
                     
                     # Trading recommendation
                     f.write(f"TRADING RECOMMENDATION\n")
-                    f.write(f"━━━━━━━━━━━━━━━━━━━━\n")
+                    f.write(f"---------------------\n")
                     
-                    recommendation = results['trading_signals']['recommendation']
-                    signal_strength = results['trading_signals']['current_signal']
+                    recommendation = analysis_results['trading_signals']['recommendation']
+                    signal_strength = analysis_results['trading_signals']['current_signal']
                     
                     # Format recommendation with emphasis
                     if recommendation == "Buy":
@@ -930,64 +1607,64 @@ def main():
                         
                     f.write(f"Current Recommendation: {rec_formatted}\n")
                     f.write(f"Signal Strength: {signal_strength:.2f}\n")
-                    f.write(f"RSI Signal: {'Bullish' if results['trading_signals']['rsi_signal'] > 0 else 'Bearish' if results['trading_signals']['rsi_signal'] < 0 else 'Neutral'}\n")
-                    f.write(f"Moving Average Signal: {'Bullish' if results['trading_signals']['ma_signal'] > 0 else 'Bearish' if results['trading_signals']['ma_signal'] < 0 else 'Neutral'}\n")
-                    f.write(f"MACD Signal: {'Bullish' if results['trading_signals']['macd_signal'] > 0 else 'Bearish' if results['trading_signals']['macd_signal'] < 0 else 'Neutral'}\n\n")
+                    f.write(f"RSI Signal: {'Bullish' if analysis_results['trading_signals']['rsi_signal'] > 0 else 'Bearish' if analysis_results['trading_signals']['rsi_signal'] < 0 else 'Neutral'}\n")
+                    f.write(f"Moving Average Signal: {'Bullish' if analysis_results['trading_signals']['ma_signal'] > 0 else 'Bearish' if analysis_results['trading_signals']['ma_signal'] < 0 else 'Neutral'}\n")
+                    f.write(f"MACD Signal: {'Bullish' if analysis_results['trading_signals']['macd_signal'] > 0 else 'Bearish' if analysis_results['trading_signals']['macd_signal'] < 0 else 'Neutral'}\n\n")
                     
                     # Risk assessment
                     f.write(f"RISK ASSESSMENT\n")
-                    f.write(f"━━━━━━━━━━━━━━\n")
-                    f.write(f"Volatility Risk: {results['risk_assessment']['volatility_risk']}\n")
-                    f.write(f"Predicted Change: {results['risk_assessment']['predicted_change']:.2%}\n")
-                    f.write(f"Downside Risk: {results['risk_assessment']['downside_risk']:.2%}\n")
-                    f.write(f"Risk-Adjusted Return: {results['risk_assessment']['risk_adjusted_return']:.2f}\n")
-                    f.write(f"Overall Risk Level: {results['risk_assessment']['overall_risk']}\n\n")
+                    f.write(f"--------------\n")
+                    f.write(f"Volatility Risk: {analysis_results['risk_assessment']['volatility_risk']}\n")
+                    f.write(f"Predicted Change: {analysis_results['risk_assessment']['predicted_change']:.2%}\n")
+                    f.write(f"Downside Risk: {analysis_results['risk_assessment']['downside_risk']:.2%}\n")
+                    f.write(f"Risk-Adjusted Return: {analysis_results['risk_assessment']['risk_adjusted_return']:.2f}\n")
+                    f.write(f"Overall Risk Level: {analysis_results['risk_assessment']['overall_risk']}\n\n")
                     
                     # Sector comparison
                     f.write(f"SECTOR COMPARISON\n")
-                    f.write(f"━━━━━━━━━━━━━━━━\n")
-                    f.write(f"Sector: {results['sector_analysis']['sector']}\n")
-                    f.write(f"Sector ETF: {results['sector_analysis']['sector_etf']}\n")
-                    f.write(f"Stock Return: {results['sector_analysis']['stock_return']:.2%}\n")
-                    f.write(f"Sector Return: {results['sector_analysis']['sector_return']:.2%}\n")
-                    f.write(f"Relative Performance: {results['sector_analysis']['relative_performance']:.2%}\n")
-                    f.write(f"Alpha: {results['sector_analysis']['alpha']:.2%}\n")
-                    f.write(f"Beta: {results['sector_analysis']['beta']:.2f}\n")
-                    if 'stock_sharpe' in results['sector_analysis']:
-                        f.write(f"Stock Sharpe Ratio: {results['sector_analysis']['stock_sharpe']:.2f}\n")
-                        f.write(f"Sector Sharpe Ratio: {results['sector_analysis']['sector_sharpe']:.2f}\n")
+                    f.write(f"-----------------\n")
+                    f.write(f"Sector: {analysis_results['sector_analysis']['sector']}\n")
+                    f.write(f"Sector ETF: {analysis_results['sector_analysis']['sector_etf']}\n")
+                    f.write(f"Stock Return: {analysis_results['sector_analysis']['stock_return']:.2%}\n")
+                    f.write(f"Sector Return: {analysis_results['sector_analysis']['sector_return']:.2%}\n")
+                    f.write(f"Relative Performance: {analysis_results['sector_analysis']['relative_performance']:.2%}\n")
+                    f.write(f"Alpha: {analysis_results['sector_analysis']['alpha']:.2%}\n")
+                    f.write(f"Beta: {analysis_results['sector_analysis']['beta']:.2f}\n")
+                    if 'stock_sharpe' in analysis_results['sector_analysis']:
+                        f.write(f"Stock Sharpe Ratio: {analysis_results['sector_analysis']['stock_sharpe']:.2f}\n")
+                        f.write(f"Sector Sharpe Ratio: {analysis_results['sector_analysis']['sector_sharpe']:.2f}\n")
                     f.write("\n")
                     
                     # Model performance metrics
                     f.write(f"MODEL PERFORMANCE METRICS\n")
-                    f.write(f"━━━━━━━━━━━━━━━━━━━━━━━\n")
-                    f.write(f"Mean Absolute Error: {results['metrics']['mae']:.4f}\n")
-                    f.write(f"Mean Squared Error: {results['metrics']['mse']:.4f}\n")
-                    f.write(f"Root Mean Squared Error: {results['metrics']['rmse']:.4f}\n\n")
+                    f.write(f"------------------------\n")
+                    f.write(f"Mean Absolute Error: {analysis_results['metrics']['mae']:.4f}\n")
+                    f.write(f"Mean Squared Error: {analysis_results['metrics']['mse']:.4f}\n")
+                    f.write(f"Root Mean Squared Error: {analysis_results['metrics']['rmse']:.4f}\n\n")
                     
                     # Model parameters
                     f.write(f"MODEL PARAMETERS\n")
-                    f.write(f"━━━━━━━━━━━━━━━\n")
-                    f.write(f"Sequence Length: {results['model_params']['sequence_length']}\n")
-                    f.write(f"Prediction Horizon: {results['model_params']['prediction_days']} days\n\n")
+                    f.write(f"---------------\n")
+                    f.write(f"Sequence Length: {analysis_results['model_params']['sequence_length']}\n")
+                    f.write(f"Prediction Horizon: {analysis_results['model_params']['prediction_days']} days\n\n")
                     
                     # Future price predictions
                     f.write(f"FUTURE PRICE PREDICTIONS\n")
-                    f.write(f"━━━━━━━━━━━━━━━━━━━━━\n")
+                    f.write(f"-----------------------\n")
                     f.write("Date            | Price    | 95% Confidence Interval\n")
                     f.write("-------------------------------------------------\n")
                     
                     for date, price, lower, upper in zip(
-                        results['future_predictions']['dates'],
-                        results['future_predictions']['prices'],
-                        results['future_predictions']['lower_bound'],
-                        results['future_predictions']['upper_bound']):
+                        analysis_results['future_predictions']['dates'],
+                        analysis_results['future_predictions']['prices'],
+                        analysis_results['future_predictions']['lower_bound'],
+                        analysis_results['future_predictions']['upper_bound']):
                         f.write(f"{date.strftime('%Y-%m-%d')} | ${price:.2f}  | (${lower:.2f} - ${upper:.2f})\n")
                     f.write("\n")
                     
                     # Analysis conclusion
                     f.write(f"ANALYSIS CONCLUSION\n")
-                    f.write(f"━━━━━━━━━━━━━━━━━\n")
+                    f.write(f"------------------\n")
                     
                     # Generate conclusion text based on all the analysis
                     conclusion = []
@@ -1001,30 +1678,30 @@ def main():
                         conclusion.append(f"Technical indicators suggest a HOLD recommendation for {args.symbol} with a neutral signal strength of {signal_strength:.2f}.")
                     
                     # Risk conclusion
-                    risk_level = results['risk_assessment']['overall_risk']
+                    risk_level = analysis_results['risk_assessment']['overall_risk']
                     if risk_level == "Low":
-                        conclusion.append(f"The stock shows low risk characteristics with a volatility of {results['model_params']['volatility']:.4f} and a positive risk-adjusted return of {results['risk_assessment']['risk_adjusted_return']:.2f}.")
+                        conclusion.append(f"The stock shows low risk characteristics with a volatility of {analysis_results['model_params']['volatility']:.4f} and a positive risk-adjusted return of {analysis_results['risk_assessment']['risk_adjusted_return']:.2f}.")
                     elif risk_level == "Medium":
-                        conclusion.append(f"The stock shows moderate risk with a volatility of {results['model_params']['volatility']:.4f} and a risk-adjusted return of {results['risk_assessment']['risk_adjusted_return']:.2f}.")
+                        conclusion.append(f"The stock shows moderate risk with a volatility of {analysis_results['model_params']['volatility']:.4f} and a risk-adjusted return of {analysis_results['risk_assessment']['risk_adjusted_return']:.2f}.")
                     else:
-                        conclusion.append(f"The stock shows high risk characteristics with a volatility of {results['model_params']['volatility']:.4f} and a risk-adjusted return of {results['risk_assessment']['risk_adjusted_return']:.2f}.")
+                        conclusion.append(f"The stock shows high risk characteristics with a volatility of {analysis_results['model_params']['volatility']:.4f} and a risk-adjusted return of {analysis_results['risk_assessment']['risk_adjusted_return']:.2f}.")
                     
                     # Sector comparison conclusion
-                    rel_perf = results['sector_analysis']['relative_performance']
+                    rel_perf = analysis_results['sector_analysis']['relative_performance']
                     if rel_perf > 0:
-                        conclusion.append(f"{args.symbol} has outperformed its sector by {rel_perf:.2%} with a beta of {results['sector_analysis']['beta']:.2f} and alpha of {results['sector_analysis']['alpha']:.2%}.")
+                        conclusion.append(f"{args.symbol} has outperformed its sector by {rel_perf:.2%} with a beta of {analysis_results['sector_analysis']['beta']:.2f} and alpha of {analysis_results['sector_analysis']['alpha']:.2%}.")
                     else:
-                        conclusion.append(f"{args.symbol} has underperformed its sector by {-rel_perf:.2%} with a beta of {results['sector_analysis']['beta']:.2f} and alpha of {results['sector_analysis']['alpha']:.2%}.")
+                        conclusion.append(f"{args.symbol} has underperformed its sector by {-rel_perf:.2%} with a beta of {analysis_results['sector_analysis']['beta']:.2f} and alpha of {analysis_results['sector_analysis']['alpha']:.2%}.")
                     
                     # Future prediction conclusion
-                    future_prices = results['future_predictions']['prices']
-                    current_price = results['current_price']
+                    future_prices = analysis_results['future_predictions']['prices']
+                    current_price = analysis_results['current_price']
                     price_change = (future_prices[-1] - current_price) / current_price
                     
                     if price_change > 0:
-                        conclusion.append(f"The model predicts a {price_change:.2%} increase in price over the next {results['model_params']['prediction_days']} days, with an upward trend.")
+                        conclusion.append(f"The model predicts a {price_change:.2%} increase in price over the next {analysis_results['model_params']['prediction_days']} days, with an upward trend.")
                     else:
-                        conclusion.append(f"The model predicts a {-price_change:.2%} decrease in price over the next {results['model_params']['prediction_days']} days, with a downward trend.")
+                        conclusion.append(f"The model predicts a {-price_change:.2%} decrease in price over the next {analysis_results['model_params']['prediction_days']} days, with a downward trend.")
                     
                     # Overall conclusion
                     if recommendation == "Buy" and risk_level != "High" and price_change > 0:
@@ -1041,17 +1718,57 @@ def main():
                     # Disclaimer
                     f.write("\n")
                     f.write("DISCLAIMER\n")
-                    f.write("━━━━━━━━━━\n")
+                    f.write("----------\n")
                     f.write("This analysis is for informational purposes only and not a recommendation to buy or sell any securities.\n")
                     f.write("Past performance does not guarantee future results. All investments involve risk.\n")
                     f.write("Always conduct your own research and consider seeking advice from a financial professional.\n")
                 
-                print(f"\nResults saved to {results_file}")
+                print(f"\nAnalysis results saved to {results_file}")
                 print(f"Visualizations saved to {args.output} directory")
-                if not args.no_plots:
-                    print(f"Dashboard saved as {args.symbol}_dashboard.png")
+        
+        # Run backtesting if requested
+        if args.backtest:
+            print(f"\nRunning backtesting for {args.symbol}...")
+            backtest_metrics = backtest_strategy(
+                args.symbol, 
+                args.start_date, 
+                args.end_date, 
+                output_dir, 
+                args.initial_capital
+            )
+            
+            if backtest_metrics:
+                print("\nBacktest Summary:")
+                print(f"Total Return: {backtest_metrics['total_return']:.2%}")
+                print(f"Buy & Hold Return: {backtest_metrics['benchmark_return']:.2%}")
+                print(f"Excess Return: {backtest_metrics['excess_return']:.2%}")
+                print(f"Sharpe Ratio: {backtest_metrics['sharpe_ratio']:.2f}")
+                print(f"Win Rate: {backtest_metrics['win_rate']:.2%}")
+                print(f"Maximum Drawdown: {backtest_metrics['max_drawdown']:.2%}")
+                print(f"\nFull backtest results saved to {args.output} directory")
+        
+        # Create comprehensive dashboard if both analysis and backtest were performed
+        if (args.full_dashboard or args.backtest) and analysis_results and backtest_metrics and output_dir:
+            if df_original is not None and signals is not None and future_predictions is not None:
+                print("\nGenerating comprehensive dashboard...")
+                create_comprehensive_dashboard(
+                    args.symbol,
+                    analysis_results,
+                    backtest_metrics,
+                    df_original,
+                    signals,
+                    future_predictions,
+                    output_dir
+                )
+            else:
+                print("\nCannot generate comprehensive dashboard: missing required data files.")
+                print("Try re-running the analysis without --no-plots option to generate all required files.")
+                
     except Exception as e:
         print(f"Error analyzing stock: {str(e)}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
