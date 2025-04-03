@@ -176,7 +176,7 @@ python backend/src/data/preprocess.py
 python backend/src/models/training.py
 ```
 
-## Research Team
+## Author:
 
 ### Shashank Raj
 - **Experience**: 
@@ -184,24 +184,6 @@ python backend/src/models/training.py
   - Developed high-performance algorithms for optimization problems
   - Expertise in neural network architecture design and implementation
 - **Current Work**: Leading the development of deep learning models for financial prediction
-
-### Dawson Mohr
-- **Experience**:
-
-- **Current Work**: Developing data processing pipelines and feature engineering systems
-
-### Raama Katragadda
-- **Experience**:
-- **Current Work**: Implementing and optimizing LSTM architectures for time series prediction
-
-### Anurag Senapaty
-- **Experience**:
-
-- **Current Work**: Designing and implementing the system architecture for model deployment
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Contributing
 
